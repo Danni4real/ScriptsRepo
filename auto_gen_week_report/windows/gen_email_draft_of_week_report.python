@@ -1,0 +1,231 @@
+import os
+import json
+import email
+import socket
+import paramiko
+import pythoncom
+import subprocess
+import win32com.client
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+
+
+# ===================== 配置区，修改为你的信息 =====================
+UBUNTU_IP = "192.168.227.136"
+UBUNTU_TCP_PORT = 9988
+UBUNTU_USER = "dan"
+UBUNTU_PWD = "1"
+UBUNTU_FOLDER = "/home/dan/weekly_report/2026"
+WINDOWS_SAVE_DIR = r"C:\Users\nidan\weekreport"
+SUFFIX = ".doc"
+# =================================================================
+
+
+def send_command_to_ubuntu(cmd):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((UBUNTU_IP, UBUNTU_TCP_PORT))
+    sock.sendall(cmd.encode("utf-8"))
+    resp_data = sock.recv(8192)
+    sock.close()
+    result = json.loads(resp_data.decode("utf-8"))
+    print(result)
+    return result
+
+
+def get_latest_week_report_from_ubuntu():
+    transport = paramiko.Transport((UBUNTU_IP, 22))
+    transport.connect(username=UBUNTU_USER, password=UBUNTU_PWD)
+    sftp = paramiko.SFTPClient.from_transport(transport)
+
+    file_list = []
+    for entry in sftp.listdir_attr(UBUNTU_FOLDER):
+        fname = entry.filename
+        if fname.lower().endswith(SUFFIX):
+            # st_mtime 文件修改时间
+            mtime = entry.st_mtime
+            remote_full_path = UBUNTU_FOLDER + "/" + fname
+            file_list.append((mtime, fname, remote_full_path))
+
+    if not file_list:
+        print(f"目录 {UBUNTU_FOLDER} 下没有 {SUFFIX} 文件")
+        sftp.close()
+        transport.close()
+        return None
+
+    # 按修改时间倒序，取最新一个
+    file_list.sort(key=lambda x: x[0], reverse=True)
+    latest_mtime, latest_name, latest_remote_path = file_list[0]
+    local_save_path = os.path.join(WINDOWS_SAVE_DIR, latest_name)
+
+    print(f"找到最新文件：{latest_name}")
+    print(f"开始下载 {latest_remote_path} -> {local_save_path}")
+    sftp.get(latest_remote_path, local_save_path)
+    print("下载完成")
+
+    sftp.close()
+    transport.close()
+    return local_save_path
+
+
+def gen_mail_subject() -> str:
+    today = datetime.now()
+    monday = today - timedelta(days=today.weekday())
+    friday = monday + timedelta(days=4)
+    subject = (f"网联软件开发部-倪丹-{monday.strftime('%Y年%m月%d日')}"
+               f"--{friday.strftime('%Y年%m月%d日')} 工作周报")
+    return subject
+
+
+def find_last_report(outlook_app):
+    """只找上一封周报邮件对象，不再做正则提取头部，头部直接硬编码使用真实Word输出片段"""
+    print("进入find_last_report")
+    ns = outlook_app.GetNamespace("MAPI")
+    sent_box = ns.GetDefaultFolder(5)   #5=已发送邮件
+    print("发件箱拿到")
+
+    items = sent_box.Items
+    items.Sort("[SentOn]", True)
+
+    target_mail = None
+    count = 0
+    for item in items:
+        count += 1
+        if count > 100:
+            break
+        if item.Class != 43:
+            continue
+        subject = item.Subject
+        if "周报" in subject:
+            print(f"✅匹配到上一封周报，主题:{subject}")
+            target_mail = item
+            break
+
+    print(f"循环结束，找到目标邮件? {target_mail is not None}")
+    return target_mail
+
+
+def extract_style_and_table_from_html(html_str):
+    soup = BeautifulSoup(html_str, "html.parser")
+    # 取出head里面全部style内容
+    style_tag = soup.find("style")
+    style_content = ""
+    if style_tag:
+        style_content = str(style_tag)
+    
+    table_list = soup.find_all("table")
+    table_html_list = []
+    for tbl in table_list:
+        table_html_list.append(str(tbl))
+    return style_content, table_html_list[0]
+
+
+def extract_html_from_mht(mht_file_path):
+    with open(mht_file_path, "rb") as f:
+        msg = email.message_from_bytes(f.read())
+
+    html_str = None
+    for part in msg.walk():
+        # 找到text/html主文档
+        if part.get_content_type() == "text/html":
+            payload_bytes = part.get_payload(decode=True)
+            # 读取编码，Word生成的mht一般是gb2312/gbk
+            charset = part.get_charset()
+            if charset is None:
+                charset = "gbk"
+            html_str = payload_bytes.decode(charset, errors="replace")
+            break
+    return html_str
+
+
+def extract_report_html_from_doc(src_doc: str) -> str:
+    vbs_path = r"C:\Users\nidan\weekreport\doc2mht.vbs"
+    out_mht = r"C:\Users\nidan\weekreport\工作周报.python" # 将文件后缀设为python（而不是mht），是为了规避加密系统
+
+    cmd = [
+        "cscript",
+        "//nologo",
+        vbs_path,
+        src_doc,
+        out_mht
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print("VBS标准输出：", result.stdout)
+        print("转换成功")
+	
+        style, table = extract_style_and_table_from_html(extract_html_from_mht(out_mht))
+        report_html = f"<html><head>{style}</head><body>{table}</body></html>"
+			
+        os.remove(out_mht)
+        return report_html
+		
+    except subprocess.CalledProcessError as e:
+        print("VBS执行失败，返回码：", e.returncode)
+        print("stderr：", e.stderr)
+    except Exception as e:
+        print("其他错误：", str(e))
+	
+	
+def get_week_report_path() -> str:
+    cwd = os.getcwd()
+    file_list = os.listdir(cwd)
+    target_file = None
+    for fname in file_list:
+        if fname.lower().startswith("工作周报") and fname.endswith(".doc"):
+            target_file = fname
+            break
+    if not target_file:
+        print("当前目录找不到【工作周报】开头的doc/docx文件")
+        return "<p>未找到工作周报文档</p>"
+
+    return os.path.join(cwd, target_file)
+	
+
+
+if __name__ == "__main__":
+    try:
+        print("===脚本开始===")
+        
+        send_command_to_ubuntu("cd ~/weekly_report/;./report_gen.sh")
+        get_latest_week_report_from_ubuntu()
+        current_report_path = get_week_report_path()
+		
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        print("outlook com对象获取成功")
+
+        mail_subject = gen_mail_subject()
+        print(f"生成本周周报主题：{mail_subject}")
+
+        last_report = find_last_report(outlook)
+
+        # ==========邮件头式样和内容==========
+        header_html = """
+<p><span lang=EN-US style='font-size:10.5pt;font-family:"Calibri",sans-serif;color:#1F497D'>Dear&nbsp;</span><span style='font-size:10.5pt;color:#1F497D'>卢东：</span><span lang=EN-US style='font-family:"Calibri",sans-serif;color:black'><o:p></o:p></span></p>
+<p><span lang=EN-US style='font-size:10.5pt;font-family:"Calibri",sans-serif;color:#1F497D'>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span><span style='font-size:10.5pt;color:#1F497D'>以下是倪丹的周报</span><span lang=EN-US style='color:black'><o:p></o:p></span></p>
+<p class=MsoNormal><span lang=EN-US style='font-size:10.5pt;font-family:"Calibri",sans-serif'><o:p>&nbsp;</o:p></span></p>
+"""
+
+        report_html = extract_report_html_from_doc(current_report_path)
+		
+        if not last_report:
+            print("❌发件箱未找到主题含【周报】的邮件")
+        else:
+            reply = last_report.ReplyAll()
+            print("已生成ReplyAll草稿")
+
+            #拼接顺序：头 + 本周周报内容 + 原邮件引用（保留上周全部内容）
+            full_new_body = header_html + report_html
+            reply.HTMLBody = full_new_body + reply.HTMLBody
+
+            reply.Subject = mail_subject
+            reply.Attachments.Add(current_report_path)
+            reply.Save()
+            os.remove(current_report_path)
+            print("✅已保存草稿到Outlook草稿箱，请打开Outlook草稿箱检查内容！")
+            # reply.Send()
+        print("===脚本正常结束===")
+    except Exception as e:
+        print(f"!!!!异常捕获!!!! {type(e)} {e}")
+        import traceback
+        traceback.print_exc()

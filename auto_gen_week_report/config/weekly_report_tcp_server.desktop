@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=TcpReportServer
+Exec=/home/dan/weekly_report/run_tcp_server.sh
+Comment=Weekly report tcp server
+

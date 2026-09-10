@@ -1,0 +1,7 @@
+1. copy every thing in this folder to Ubuntu /home/dan/weekly_report/;
+2. copy config/weekly_report_tcp_server.desktop to ~/.config/autostart/;
+3. restart Ubuntu;
+4. copy scripts in windows/ to Windows C:\Users\nidan\weekreport\;
+5. move "gen week report.bat" to Desktop in Windows;
+6. make sure there is already a old weekly_report doc in /home/dan/weekly_report/XXyear/;
+7. double click "gen week report.bat" to generate week report in outlook draft folder;
